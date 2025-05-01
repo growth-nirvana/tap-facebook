@@ -191,7 +191,20 @@ class AdsInsightStream(Stream):
                 time_start = time.time()
                 while status != "Job Completed":
                     duration = time.time() - time_start
-                    job = job.api_get()
+                    try:
+                        job = job.api_get()
+                    except TypeError as e:
+                        self.logger.warning("Caught TypeError in job.api_get(): %s", str(e))
+                        if retry_count < max_retries - 1:
+                            retry_count += 1
+                            time.sleep(SLEEP_TIME_INCREMENT * (retry_count + 1))
+                            self.logger.warning(
+                                "Retrying job.api_get() after TypeError... attempt %d", retry_count
+                            )
+                            break  # Break inner loop to retry
+                        else:
+                            raise
+                
                     status = job[AdReportRun.Field.async_status]
                     percent_complete = job[AdReportRun.Field.async_percent_completion]
 
@@ -247,7 +260,7 @@ class AdsInsightStream(Stream):
                         SLEEP_TIME_INCREMENT,
                     )
                     time.sleep(SLEEP_TIME_INCREMENT)
-            except RuntimeError as e:
+            except (RuntimeError, TypeError) as e:
                 if retry_count >= max_retries - 1:
                     raise e
                 retry_count += 1
