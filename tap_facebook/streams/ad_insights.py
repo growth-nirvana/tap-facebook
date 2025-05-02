@@ -13,8 +13,11 @@ from facebook_business.adobjects.adreportrun import AdReportRun
 from facebook_business.adobjects.adsactionstats import AdsActionStats
 from facebook_business.adobjects.adshistogramstats import AdsHistogramStats
 from facebook_business.adobjects.adsinsights import AdsInsights
+from facebook_business.exceptions import FacebookRequestError
 from facebook_business.api import FacebookAdsApi
+
 from singer_sdk import typing as th
+
 from singer_sdk.streams.core import REPLICATION_INCREMENTAL, Stream
 
 if t.TYPE_CHECKING:
@@ -193,6 +196,24 @@ class AdsInsightStream(Stream):
                     duration = time.time() - time_start
                     try:
                         job = job.api_get()
+                    except FacebookRequestError as fb_err:
+                        error_info = getattr(fb_err, "body", {}).get("error", {})
+                        is_transient = error_info.get("is_transient", False)
+                        code = error_info.get("code")
+
+                        if is_transient and code == 2:
+                            self.logger.warning(
+                                "Transient OAuthException (code 2): %s. Retrying... (%d/%d)",
+                                error_info.get("message"),
+                                retry_count + 1,
+                                max_retries,
+                            )
+                            retry_count += 1
+                            time.sleep(SLEEP_TIME_INCREMENT * (retry_count + 1))
+                            break  # Retry outer job loop
+                        else:
+                            raise  # Not a transient error; re-raise
+
                     except TypeError as e:
                         self.logger.warning("Caught TypeError in job.api_get(): %s", str(e))
                         if retry_count < max_retries - 1:
@@ -260,7 +281,7 @@ class AdsInsightStream(Stream):
                         SLEEP_TIME_INCREMENT,
                     )
                     time.sleep(SLEEP_TIME_INCREMENT)
-            except (RuntimeError, TypeError) as e:
+            except (RuntimeError, TypeError, FacebookRequestError) as e:
                 if retry_count >= max_retries - 1:
                     raise e
                 retry_count += 1
