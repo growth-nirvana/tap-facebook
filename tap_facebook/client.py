@@ -122,10 +122,20 @@ class FacebookStream(RESTStream):
             error_json = {}
 
         error_code = error_json.get("code")
+        error_subcode = error_json.get("error_subcode")
         error_message = error_json.get("message", "")
         is_transient = error_json.get("is_transient", False)
 
         retryable_codes = {1, 2, 4, 17, 32, 341, 368, 613}
+
+        # Handle specific case of inaccessible/deleted objects (code 100, subcode 33)
+        if error_code == 100 and error_subcode == 33:
+            self.logger.info(
+                "Skipping inaccessible or deleted object: %s (path: %s)",
+                error_message,
+                full_path,
+            )
+            return
 
         if status_code in self.tolerated_http_errors:
             self.logger.info(
