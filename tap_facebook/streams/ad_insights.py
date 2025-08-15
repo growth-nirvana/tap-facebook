@@ -272,6 +272,11 @@ class AdsInsightStream(Stream):
                     time.sleep(SLEEP_TIME_INCREMENT)
 
             except (RuntimeError, FacebookRequestError) as e:
+                self.logger.warning(
+                    "Retrying job after error: %s (attempt %d/%d)",
+                    str(e), retry_count + 1, max_retries,
+                    exc_info=True
+                )
                 retry_count += 1
                 if retry_count >= max_retries:
                     self.logger.error("Job failed after all retries. Error: %s", str(e))
@@ -372,11 +377,12 @@ class AdsInsightStream(Stream):
             self._current_account_id = account_id
             self._initialize_client()
 
-            # Handle time increment - can be either days or 'monthly'
+            # Handle time increment - can be either days, 'monthly', or 'weekly'
             time_increment = self._report_definition.get("time_increment", "daily")
             time_increment_days = self._report_definition.get("time_increment_days", 1)
             
             is_monthly = time_increment == "monthly"
+            is_weekly = time_increment == "weekly"
 
             # Handle end_date being None
             config_end_date = self.config.get("end_date")
@@ -392,6 +398,9 @@ class AdsInsightStream(Stream):
             if is_monthly:
                 report_start = report_start.start_of('month')
                 report_end = report_start.end_of('month').add(days=1)
+            elif is_weekly:
+                report_start = report_start.start_of('week')  # Default: Monday
+                report_end = report_start.end_of('week').add(days=1)
             else:
                 report_end = report_start.add(days=time_increment_days)
 
@@ -415,13 +424,21 @@ class AdsInsightStream(Stream):
                 self.logger.info("From: %s\nTo: %s", report_start, actual_until)
                 self.logger.info("************************************")
 
+                # Set time_increment param for API
+                if is_monthly:
+                    api_time_increment = "monthly"
+                elif is_weekly:
+                    api_time_increment = 7
+                else:
+                    api_time_increment = time_increment_days
+
                 params = {
                     "level": self._report_definition["level"],
                     "action_breakdowns": self._report_definition["action_breakdowns"],
                     "action_report_time": self._report_definition["action_report_time"],
                     "breakdowns": self._report_definition["breakdowns"],
                     "fields": columns,
-                    "time_increment": "monthly" if is_monthly else time_increment_days,
+                    "time_increment": api_time_increment,
                     "limit": 100,
                     "action_attribution_windows": [
                         self._report_definition["action_attribution_windows_view"],
@@ -443,6 +460,9 @@ class AdsInsightStream(Stream):
                 if is_monthly:
                     report_start = report_start.add(months=1).start_of('month')
                     report_end = report_start.end_of('month').add(days=1)
+                elif is_weekly:
+                    report_start = report_start.add(weeks=1).start_of('week')
+                    report_end = report_start.end_of('week').add(days=1)
                 else:
                     report_start = report_start.add(days=time_increment_days)
                     report_end = report_end.add(days=time_increment_days)
