@@ -205,8 +205,7 @@ class AdsInsightStream(Stream):
                     try:
                         job = job.api_get()
                     except FacebookRequestError as fb_err:
-                        error_body = getattr(fb_err, "body", {})
-                        error_info = error_body.get("error", {})
+                        error_info = self._extract_facebook_error_info(fb_err)
                         code = error_info.get("code")
                         subcode = error_info.get("error_subcode")
                         is_transient = error_info.get("is_transient", False)
@@ -285,21 +284,39 @@ class AdsInsightStream(Stream):
 
         raise RuntimeError("Job failed to complete after all retries.")
 
+    def _extract_facebook_error_info(self, fb_err: FacebookRequestError) -> dict:
+        """Normalize FacebookRequestError body into an error dict."""
+        body_attr = getattr(fb_err, "body", None)
+        body_value = body_attr() if callable(body_attr) else body_attr
+
+        if isinstance(body_value, str):
+            try:
+                body_value = json.loads(body_value)
+            except json.JSONDecodeError:
+                return {}
+
+        if isinstance(body_value, dict):
+            error_info = body_value.get("error", {})
+            if isinstance(error_info, dict):
+                return error_info
+
+        return {}
+
     def _is_retryable_facebook_error(self, fb_err: FacebookRequestError) -> tuple[bool, int | None, str]:
-        error_body = getattr(fb_err, "body", {})
-        error_info = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+        error_info = self._extract_facebook_error_info(fb_err)
         code = error_info.get("code")
         is_transient = error_info.get("is_transient", False)
         message = error_info.get("message", str(fb_err))
 
         status = None
-        status_method = getattr(fb_err, "http_status", None)
-        if callable(status_method):
-            status = status_method()
+        status_attr = getattr(fb_err, "http_status", None)
+        if callable(status_attr):
+            status = status_attr()
+        elif isinstance(status_attr, int):
+            status = status_attr
 
         is_retryable = (
-            status is not None
-            and status >= 500
+            (status is not None and status >= 500)
             or is_transient
             or code in INSIGHTS_RETRYABLE_CODES
         )
