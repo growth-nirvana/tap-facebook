@@ -14,6 +14,7 @@ from tap_facebook.streams import (
     AdAccountsStream,
     AdImages,
     AdLabelsStream,
+    AdPreviewsStream,
     AdsetsStream,
     AdsInsightStream,
     AdInsightsDMAStream,
@@ -37,6 +38,7 @@ STREAM_TYPES = [
     AdImages,
     AdVideos,
     AdInsightsDMAStream,
+    AdPreviewsStream,
 ]
 
 DEFAULT_INSIGHT_REPORT = {
@@ -204,6 +206,18 @@ class TapFacebook(Tap):
                 "for more details."
             ),
             default=[],
+        ),
+        th.Property(
+            "ad_preview_formats",
+            th.ArrayType(th.StringType),
+            description=(
+                "Ad formats to request from the Meta /{ad-id}/previews endpoint "
+                "for the ad_previews stream. Each ad will be queried once per "
+                "format and yield one row per (ad_id, ad_format). Examples: "
+                "INSTAGRAM_STANDARD, INSTAGRAM_STORY, FACEBOOK_STORY, "
+                "MOBILE_FEED_STANDARD, DESKTOP_FEED_STANDARD."
+            ),
+            required=False,
         ),
         th.Property(
             "start_date",
