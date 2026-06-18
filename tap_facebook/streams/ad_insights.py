@@ -67,6 +67,8 @@ EXCLUDED_FIELDS = [
 SLEEP_TIME_INCREMENT = 5
 INSIGHTS_MAX_WAIT_TO_START_SECONDS = 5 * 60
 INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS = 30 * 60
+INSIGHTS_RESULT_MAX_RETRIES = 5
+INSIGHTS_RETRYABLE_CODES = {1, 2, 4, 17, 32, 341, 368, 613}
 
 
 class AdsInsightStream(Stream):
@@ -187,7 +189,7 @@ class AdsInsightStream(Stream):
         max_retries = 5
         base_backoff = 2
         retry_count = 0
-        retryable_codes = {1, 2, 4, 17, 32, 341, 368, 613}
+        retryable_codes = INSIGHTS_RETRYABLE_CODES
 
         while retry_count < max_retries:
             try:
@@ -203,8 +205,7 @@ class AdsInsightStream(Stream):
                     try:
                         job = job.api_get()
                     except FacebookRequestError as fb_err:
-                        error_body = getattr(fb_err, "body", {})
-                        error_info = error_body.get("error", {})
+                        error_info = self._extract_facebook_error_info(fb_err)
                         code = error_info.get("code")
                         subcode = error_info.get("error_subcode")
                         is_transient = error_info.get("is_transient", False)
@@ -282,6 +283,77 @@ class AdsInsightStream(Stream):
                 time.sleep(sleep_time)
 
         raise RuntimeError("Job failed to complete after all retries.")
+
+    def _extract_facebook_error_info(self, fb_err: FacebookRequestError) -> dict:
+        """Normalize FacebookRequestError body into an error dict."""
+        body_attr = getattr(fb_err, "body", None)
+        body_value = body_attr() if callable(body_attr) else body_attr
+
+        if isinstance(body_value, str):
+            try:
+                body_value = json.loads(body_value)
+            except json.JSONDecodeError:
+                return {}
+
+        if isinstance(body_value, dict):
+            error_info = body_value.get("error", {})
+            if isinstance(error_info, dict):
+                return error_info
+
+        return {}
+
+    def _is_retryable_facebook_error(self, fb_err: FacebookRequestError) -> tuple[bool, int | None, str]:
+        error_info = self._extract_facebook_error_info(fb_err)
+        code = error_info.get("code")
+        is_transient = error_info.get("is_transient", False)
+        message = error_info.get("message", str(fb_err))
+
+        status = None
+        status_attr = getattr(fb_err, "http_status", None)
+        if callable(status_attr):
+            status = status_attr()
+        elif isinstance(status_attr, int):
+            status = status_attr
+
+        is_retryable = (
+            (status is not None and status >= 500)
+            or is_transient
+            or code in INSIGHTS_RETRYABLE_CODES
+        )
+        return is_retryable, code, message
+
+    def _iter_job_results_with_retry(
+        self,
+        job: AdReportRun,
+        since: str,
+        until: str,
+    ) -> t.Iterator[dict]:
+        """Yield job results with retry for transient Facebook API failures."""
+        base_backoff = 2
+
+        for attempt in range(1, INSIGHTS_RESULT_MAX_RETRIES + 1):
+            try:
+                for obj in job.get_result():
+                    yield obj.export_all_data()
+                return
+            except FacebookRequestError as fb_err:
+                is_retryable, code, message = self._is_retryable_facebook_error(fb_err)
+                if not is_retryable or attempt >= INSIGHTS_RESULT_MAX_RETRIES:
+                    raise
+
+                sleep_time = min(base_backoff ** attempt, 300)
+                self.logger.warning(
+                    "Transient error while fetching results for %s - %s (code=%s): %s. "
+                    "Retrying %d/%d after %s seconds.",
+                    since,
+                    until,
+                    code,
+                    message,
+                    attempt,
+                    INSIGHTS_RESULT_MAX_RETRIES,
+                    sleep_time,
+                )
+                time.sleep(sleep_time)
 
 
     def _get_selected_columns(self) -> list[str]:
@@ -437,8 +509,15 @@ class AdsInsightStream(Stream):
                 self.logger.info("%s", params)
                 self.logger.info("************************************")
                 job = self._run_job_to_completion(params)  # type: ignore[func-returns-value]
-                for obj in job.get_result():
-                    yield obj.export_all_data()
+                if job is None:
+                    # Job can be skipped for known non-retryable request issues.
+                    continue
+
+                yield from self._iter_job_results_with_retry(
+                    job=job,
+                    since=params["time_range"]["since"],
+                    until=params["time_range"]["until"],
+                )
                 # Bump to the next increment
                 if is_monthly:
                     report_start = report_start.add(months=1).start_of('month')
