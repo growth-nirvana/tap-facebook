@@ -12,6 +12,7 @@ if t.TYPE_CHECKING:
 
 from tap_facebook.streams import (
     AdAccountsStream,
+    AdCreativeImagesStream,
     AdImages,
     AdLabelsStream,
     AdPreviewsStream,
@@ -39,6 +40,7 @@ STREAM_TYPES = [
     AdVideos,
     AdInsightsDMAStream,
     AdPreviewsStream,
+    AdCreativeImagesStream,
 ]
 
 DEFAULT_INSIGHT_REPORT = {
