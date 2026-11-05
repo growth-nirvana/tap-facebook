@@ -513,7 +513,11 @@ class AdsInsightStream(Stream):
             # >>> FIX: Remove breakdowns and run_id from columns
             columns = [col for col in columns if col not in self._report_definition["breakdowns"] and col != "run_id"]
 
-            days_per_job = int(self._report_definition.get("days_per_job") or time_increment_days)
+            days_per_job = int(
+                self._report_definition.get("days_per_job")
+                or self.config.get("days_per_job")
+                or time_increment_days
+            )
             for since, until in job_windows(report_start, sync_end_date, days_per_job, time_increment_days, is_monthly):
                 yield from self._fetch_window(
                     since,

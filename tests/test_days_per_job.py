@@ -83,3 +83,12 @@ def test_a_single_day_that_is_too_large_fails_clearly():
     stream = make_stream(too_large_over_days=0)
     with pytest.raises(RuntimeError, match="2026-10-01 - 2026-10-01 failed"):
         list(stream._fetch_window(D(2026, 10, 1), D(2026, 10, 1), ["spend"], time_increment=1, min_days=1))
+
+
+def test_the_tap_wide_setting_reaches_the_default_report():
+    from tap_facebook.tap import TapFacebook
+
+    tap = TapFacebook(config={"access_token": "x", "account_ids": "1", "start_date": "2026-10-01T00:00:00Z", "days_per_job": 30}, parse_env_config=False)
+    default = next(s for s in tap.discover_streams() if s.name == "adsinsights_default")
+    assert default._report_definition.get("days_per_job") is None  # its own definition says nothing
+    assert default.config.get("days_per_job") == 30  # so the tap-wide value applies
