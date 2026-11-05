@@ -69,6 +69,37 @@ INSIGHTS_MAX_WAIT_TO_START_SECONDS = 5 * 60
 INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS = 30 * 60
 INSIGHTS_RESULT_MAX_RETRIES = 5
 INSIGHTS_RETRYABLE_CODES = {1, 2, 4, 17, 32, 341, 368, 613}
+# Meta's "please reduce the amount of data you're asking for" (code 100).
+INSIGHTS_TOO_MUCH_DATA_SUBCODE = 1487534
+INSIGHTS_RESULT_PAGE_SIZE = 500
+
+
+def job_windows(
+    start: pendulum.Date,
+    end: pendulum.Date,
+    days_per_job: int,
+    time_increment_days: int,
+    is_monthly: bool,
+) -> t.Iterator[tuple[pendulum.Date, pendulum.Date]]:
+    """Inclusive (since, until) windows from start to end, one async job each: calendar
+    months for a monthly report, else days_per_job days rounded down to a multiple of
+    time_increment_days (at least one increment)."""
+    if is_monthly:
+        since = start
+        while since <= end:
+            yield since, min(since.end_of("month"), end)
+            since = since.add(months=1).start_of("month")
+        return
+    size = max(time_increment_days, days_per_job - days_per_job % time_increment_days)
+    since = start
+    while since <= end:
+        until = min(since.add(days=size - 1), end)
+        yield since, until
+        since = until.add(days=1)
+
+
+class InsightsJobTooLarge(Exception):
+    """The job asked for too much data, or did not finish in time: ask for fewer days."""
 
 
 class AdsInsightStream(Stream):
@@ -222,6 +253,8 @@ class AdsInsightStream(Stream):
                             )
                             time.sleep(sleep_time)
                             break  # Retry outer job loop
+                        elif code == 100 and subcode == INSIGHTS_TOO_MUCH_DATA_SUBCODE:
+                            raise InsightsJobTooLarge(message) from fb_err
                         elif code == 100 and subcode == 33:
                             fields = params.get("fields", [])
                             self.logger.warning(
@@ -265,7 +298,7 @@ class AdsInsightStream(Stream):
                             f"Insights job {job_id} did not start after {INSIGHTS_MAX_WAIT_TO_START_SECONDS} seconds."
                         )
                     if duration > INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS:
-                        raise RuntimeError(
+                        raise InsightsJobTooLarge(
                             f"Insights job {job_id} did not complete after {INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS // 60} minutes."
                         )
 
@@ -273,6 +306,8 @@ class AdsInsightStream(Stream):
                     time.sleep(SLEEP_TIME_INCREMENT)
 
             except (RuntimeError, FacebookRequestError) as e:
+                if isinstance(e, FacebookRequestError) and e.api_error_subcode() == INSIGHTS_TOO_MUCH_DATA_SUBCODE:
+                    raise InsightsJobTooLarge(e.api_error_message()) from e
                 retry_count += 1
                 if retry_count >= max_retries:
                     self.logger.error("Job failed after all retries. Error: %s", str(e))
@@ -333,7 +368,7 @@ class AdsInsightStream(Stream):
 
         for attempt in range(1, INSIGHTS_RESULT_MAX_RETRIES + 1):
             try:
-                for obj in job.get_result():
+                for obj in job.get_result(params={"limit": INSIGHTS_RESULT_PAGE_SIZE}):
                     yield obj.export_all_data()
                 return
             except FacebookRequestError as fb_err:
@@ -463,9 +498,6 @@ class AdsInsightStream(Stream):
             report_start = self._get_start_date(context)
             if is_monthly:
                 report_start = report_start.start_of('month')
-                report_end = report_start.end_of('month').add(days=1)
-            else:
-                report_end = report_start.add(days=time_increment_days)
 
             self.logger.info("********** DATE RANGE FOR ACCOUNT **********")
             self.logger.info(
@@ -481,47 +513,70 @@ class AdsInsightStream(Stream):
             # >>> FIX: Remove breakdowns and run_id from columns
             columns = [col for col in columns if col not in self._report_definition["breakdowns"] and col != "run_id"]
 
-            while report_start <= sync_end_date:
-                actual_until = min(report_end.subtract(days=1), sync_end_date)
-                self.logger.info("********** FETCHING DATE RANGE **********")
-                self.logger.info("From: %s\nTo: %s", report_start, actual_until)
-                self.logger.info("************************************")
-
-                params = {
-                    "level": self._report_definition["level"],
-                    "action_breakdowns": self._report_definition["action_breakdowns"],
-                    "action_report_time": self._report_definition["action_report_time"],
-                    "breakdowns": self._report_definition["breakdowns"],
-                    "fields": columns,
-                    "time_increment": "monthly" if is_monthly else time_increment_days,
-                    "limit": 100,
-                    "action_attribution_windows": [
-                        self._report_definition["action_attribution_windows_view"],
-                        self._report_definition["action_attribution_windows_click"],
-                    ],
-                    "use_unified_attribution_setting": True,
-                    "time_range": {
-                        "since": report_start.to_date_string(),
-                        "until": actual_until.to_date_string(),
-                    },
-                }
-                self.logger.info("********** API REQUEST PARAMS **********")
-                self.logger.info("%s", params)
-                self.logger.info("************************************")
-                job = self._run_job_to_completion(params)  # type: ignore[func-returns-value]
-                if job is None:
-                    # Job can be skipped for known non-retryable request issues.
-                    continue
-
-                yield from self._iter_job_results_with_retry(
-                    job=job,
-                    since=params["time_range"]["since"],
-                    until=params["time_range"]["until"],
+            days_per_job = int(self._report_definition.get("days_per_job") or time_increment_days)
+            for since, until in job_windows(report_start, sync_end_date, days_per_job, time_increment_days, is_monthly):
+                yield from self._fetch_window(
+                    since,
+                    until,
+                    columns,
+                    time_increment="monthly" if is_monthly else time_increment_days,
+                    min_days=31 if is_monthly else time_increment_days,
                 )
-                # Bump to the next increment
-                if is_monthly:
-                    report_start = report_start.add(months=1).start_of('month')
-                    report_end = report_start.end_of('month').add(days=1)
-                else:
-                    report_start = report_start.add(days=time_increment_days)
-                    report_end = report_end.add(days=time_increment_days)
+
+    def _fetch_window(
+        self,
+        since: pendulum.Date,
+        until: pendulum.Date,
+        columns: list[str],
+        *,
+        time_increment: int | str,
+        min_days: int,
+    ) -> t.Iterator[dict]:
+        """One async job for since..until (inclusive). When Meta says it is too much data, or
+        it does not finish in time, the window is split in two (on increment boundaries)."""
+        self.logger.info("********** FETCHING DATE RANGE **********")
+        self.logger.info("From: %s\nTo: %s", since, until)
+        self.logger.info("************************************")
+        params = {
+            "level": self._report_definition["level"],
+            "action_breakdowns": self._report_definition["action_breakdowns"],
+            "action_report_time": self._report_definition["action_report_time"],
+            "breakdowns": self._report_definition["breakdowns"],
+            "fields": columns,
+            "time_increment": time_increment,
+            "limit": 100,
+            "action_attribution_windows": [
+                self._report_definition["action_attribution_windows_view"],
+                self._report_definition["action_attribution_windows_click"],
+            ],
+            "use_unified_attribution_setting": True,
+            "time_range": {
+                "since": since.to_date_string(),
+                "until": until.to_date_string(),
+            },
+        }
+        self.logger.info("********** API REQUEST PARAMS **********")
+        self.logger.info("%s", params)
+        self.logger.info("************************************")
+        days = (until - since).in_days() + 1
+        try:
+            job = self._run_job_to_completion(params)  # type: ignore[func-returns-value]
+        except InsightsJobTooLarge as exc:
+            if days <= min_days:
+                raise RuntimeError(f"Insights job for {since} - {until} failed: {exc}") from exc
+            half = max(min_days, (days // 2) - (days // 2) % min_days)
+            middle = since.add(days=half - 1)
+            self.logger.warning(
+                "Insights job for %s - %s asked for too much (%s); splitting into %s - %s and %s - %s.",
+                since, until, exc, since, middle, middle.add(days=1), until,
+            )
+            yield from self._fetch_window(since, middle, columns, time_increment=time_increment, min_days=min_days)
+            yield from self._fetch_window(middle.add(days=1), until, columns, time_increment=time_increment, min_days=min_days)
+            return
+        if job is None:
+            return  # skipped for a known non-retryable request issue
+        yield from self._iter_job_results_with_retry(
+            job=job,
+            since=params["time_range"]["since"],
+            until=params["time_range"]["until"],
+        )

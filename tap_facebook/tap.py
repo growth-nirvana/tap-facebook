@@ -159,6 +159,16 @@ class TapFacebook(Tap):
                         default=1,
                     ),
                     th.Property(
+                        "days_per_job",
+                        th.IntegerType,
+                        description=(
+                            "How many days one insights job covers (a multiple of "
+                            "time_increment_days; default: time_increment_days). Rows are still "
+                            "one per increment; larger values mean far fewer jobs. A job Meta "
+                            "finds too large is split in two."
+                        ),
+                    ),
+                    th.Property(
                         "action_attribution_windows_view",
                         th.StringType,
                         description=(
