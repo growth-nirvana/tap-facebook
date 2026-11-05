@@ -230,6 +230,16 @@ class TapFacebook(Tap):
             required=False,
         ),
         th.Property(
+            "days_per_job",
+            th.IntegerType,
+            description=(
+                "Default days per insights job for every report without its own "
+                "days_per_job, including the built-in adsinsights_default. Rows are still "
+                "one per time increment. Unset: one job per increment."
+            ),
+            required=False,
+        ),
+        th.Property(
             "start_date",
             th.DateTimeType,
             description="The earliest record date to sync",
